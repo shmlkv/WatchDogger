@@ -1,9 +1,11 @@
 import Cocoa
 import UserNotifications
+import Darwin
+import IOKit.ps
 
 // MARK: - Process Info
 
-struct ProcessInfo {
+struct CPUProcessInfo {
     let name: String
     let cpu: Double
     let pid: String
@@ -21,12 +23,14 @@ protocol ProcessMonitorDelegate: AnyObject {
 class ProcessMonitor {
     weak var delegate: ProcessMonitorDelegate?
 
-    var cpuHistory: [String: [Double]] = [:]
-    var lastNotified: [String: Date] = [:]
+    // All mutable state is accessed only on the main thread
+    private var cpuHistory: [String: [Double]] = [:]
+    private var lastNotified: [String: Date] = [:]
+    private var previousCPUTimes: [pid_t: (user: UInt64, system: UInt64, timestamp: TimeInterval)] = [:]
 
     // Battery state cache — re-checked every 5th monitoring cycle
-    var cachedOnBattery: Bool = false
-    var checkCycleCount: Int = 0
+    private var cachedOnBattery: Bool = false
+    private var checkCycleCount: Int = 0
     private let batteryCheckInterval = 5
 
     // System processes to exclude from monitoring
@@ -37,78 +41,139 @@ class ProcessMonitor {
         "usermanagerd", "trustd"
     ]
 
-    func getTopCPUProcesses() -> [ProcessInfo] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-eo", "pid,pcpu,comm"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
+    // MARK: Native Process Listing (libproc)
 
-        do { try task.run() } catch { return [] }
+    private struct RawProcessData {
+        let pid: pid_t
+        let name: String
+        let path: String
+        let cpuUser: UInt64
+        let cpuSystem: UInt64
+    }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
+    /// Snapshot all processes via libproc. Called on background queue.
+    private func snapshotProcesses() -> [RawProcessData] {
+        let pidCount = proc_listallpids(nil, 0)
+        guard pidCount > 0 else {
+            NSLog("WatchDogger: proc_listallpids failed")
+            return []
+        }
 
-        guard let output = String(data: data, encoding: .utf8) else { return [] }
+        var pids = [pid_t](repeating: 0, count: Int(pidCount))
+        let actualCount = proc_listallpids(&pids, Int32(MemoryLayout<pid_t>.size * pids.count))
+        guard actualCount > 0 else { return [] }
 
-        var results: [ProcessInfo] = []
-        for line in output.components(separatedBy: "\n") {
-            let parts = line.trimmingCharacters(in: .whitespaces)
-                .components(separatedBy: .whitespaces)
-                .filter { !$0.isEmpty }
+        var results: [RawProcessData] = []
+        let pathBufSize = Int(MAXPATHLEN)
+        let pathBuf = UnsafeMutablePointer<CChar>.allocate(capacity: pathBufSize)
+        defer { pathBuf.deallocate() }
 
-            guard parts.count >= 3,
-                  let cpu = Double(parts[1]),
-                  cpu >= 5.0 else { continue }
+        for i in 0..<Int(actualCount) {
+            let p = pids[i]
+            if p <= 0 { continue }
 
-            let pid = parts[0]
-            let commPath = parts.dropFirst(2).joined(separator: " ")
-            let processName = (commPath as NSString).lastPathComponent
+            var taskInfo = proc_taskinfo()
+            let tiSize = Int32(MemoryLayout<proc_taskinfo>.size)
+            let ret = proc_pidinfo(p, PROC_PIDTASKINFO, 0, &taskInfo, tiSize)
+            guard ret == tiSize else { continue }
 
-            if excludedProcesses.contains(processName) { continue }
+            // Get process path
+            memset(pathBuf, 0, pathBufSize)
+            let pathLen = proc_pidpath(p, pathBuf, UInt32(pathBufSize))
+            let path: String
+            let name: String
+            if pathLen > 0 {
+                path = String(cString: pathBuf)
+                name = (path as NSString).lastPathComponent
+            } else {
+                // Fallback: use proc_name
+                var nameBuf = [CChar](repeating: 0, count: 256)
+                proc_name(p, &nameBuf, 256)
+                name = String(cString: nameBuf)
+                path = name
+            }
 
-            results.append(ProcessInfo(name: processName, cpu: cpu, pid: pid))
+            if name.isEmpty { continue }
+
+            results.append(RawProcessData(
+                pid: p, name: name, path: path,
+                cpuUser: taskInfo.pti_total_user,
+                cpuSystem: taskInfo.pti_total_system
+            ))
+        }
+        return results
+    }
+
+    /// Calculate CPU % from two snapshots. Must be called on main thread.
+    private func calculateCPU(pid: pid_t, user: UInt64, system: UInt64) -> Double {
+        let now = Foundation.ProcessInfo.processInfo.systemUptime
+        let totalNow = user + system
+
+        if let prev = previousCPUTimes[pid] {
+            let dt = now - prev.timestamp
+            if dt > 0.1 {
+                let totalPrev = prev.user + prev.system
+                let deltaCPU = Double(totalNow - totalPrev) / 1_000_000_000.0 // ns → s
+                let cpuPercent = (deltaCPU / dt) * 100.0
+                previousCPUTimes[pid] = (user: user, system: system, timestamp: now)
+                return max(0, cpuPercent)
+            }
+        }
+
+        // First sample — store baseline, return 0
+        previousCPUTimes[pid] = (user: user, system: system, timestamp: now)
+        return 0
+    }
+
+    func getTopCPUProcesses() -> [CPUProcessInfo] {
+        // Synchronous snapshot for menu — runs on main thread
+        let snapshot = snapshotProcesses()
+
+        var results: [CPUProcessInfo] = []
+        for proc in snapshot {
+            let cpu = calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem)
+            guard cpu >= 5.0 else { continue }
+            if excludedProcesses.contains(proc.name) { continue }
+            results.append(CPUProcessInfo(name: proc.name, cpu: cpu, pid: String(proc.pid)))
         }
 
         results.sort { $0.cpu > $1.cpu }
         return Array(results.prefix(5))
     }
 
-    // MARK: Battery State
+    // MARK: Battery State (IOKit)
 
     private func updateBatteryState() {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
-        task.arguments = ["-g", "batt"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-
-        do { try task.run() } catch { return }
-
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-
-        if let output = String(data: data, encoding: .utf8) {
-            cachedOnBattery = output.contains("Battery Power")
+        guard let snapshot = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(snapshot)?.takeRetainedValue() as? [Any],
+              !sources.isEmpty else {
+            cachedOnBattery = false
+            return
         }
+
+        for source in sources {
+            if let desc = IOPSGetPowerSourceDescription(snapshot, source as CFTypeRef)?.takeUnretainedValue() as? [String: Any],
+               let powerSource = desc[kIOPSPowerSourceStateKey] as? String {
+                cachedOnBattery = (powerSource == kIOPSBatteryPowerValue)
+                return
+            }
+        }
+        cachedOnBattery = false
     }
 
     // MARK: Runaway Process Detection
 
     func checkForRunawayProcesses(immediate: Bool = false) {
         let settings = SettingsManager.shared
-        if !settings.monitorAllProcesses && !settings.monitorSafari && !settings.monitorChrome { return }
+        if !settings.monitorAllProcesses && settings.monitoredProcessNames.isEmpty { return }
 
-        // Update battery state every Nth cycle (or on first run)
+        // Update battery state every Nth cycle (on main thread via Timer)
         checkCycleCount += 1
         if checkCycleCount >= batteryCheckInterval || checkCycleCount == 1 {
             checkCycleCount = 0
             updateBatteryState()
         }
 
-        // Determine effective threshold
         let effectiveThreshold: Double
         if settings.batteryModeEnabled && cachedOnBattery {
             effectiveThreshold = settings.batteryThreshold
@@ -118,57 +183,27 @@ class ProcessMonitor {
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self = self else { return }
+            let snapshot = self.snapshotProcesses()
 
-            // Read ps output
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task.arguments = ["-eo", "pid,pcpu,comm"]
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
-
-            do { try task.run() } catch { return }
-
-            // Read data BEFORE waitUntilExit to avoid pipe buffer deadlock
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            task.waitUntilExit()
-
-            guard let output = String(data: data, encoding: .utf8) else { return }
-
-            // Parse and notify on main thread
             DispatchQueue.main.async {
                 let now = Date()
                 var activePIDs: Set<String> = []
 
-                for line in output.components(separatedBy: "\n") {
-                    let parts = line.trimmingCharacters(in: .whitespaces)
-                        .components(separatedBy: .whitespaces)
-                        .filter { !$0.isEmpty }
-
-                    guard parts.count >= 2,
-                          let cpu = Double(parts[1]) else { continue }
-
-                    let pid = parts[0]
+                for proc in snapshot {
+                    let pid = String(proc.pid)
                     activePIDs.insert(pid)
 
+                    let cpu = self.calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem)
                     guard cpu >= effectiveThreshold else { continue }
 
-                    // comm is everything after pid and cpu (may contain spaces)
-                    let commPath = parts.dropFirst(2).joined(separator: " ")
-                    // Extract last path component as process name
-                    let processName = (commPath as NSString).lastPathComponent
-
-                    let isSafari = commPath.contains("WebKit.WebContent")
-                    let isChrome = commPath.contains("Google Chrome Helper")
-
                     if settings.monitorAllProcesses {
-                        // Skip excluded system processes
-                        if self.excludedProcesses.contains(processName) { continue }
+                        if self.excludedProcesses.contains(proc.name) { continue }
                     } else {
-                        // Browser-only mode
-                        if isSafari && !settings.monitorSafari { continue }
-                        if isChrome && !settings.monitorChrome { continue }
-                        if !isSafari && !isChrome { continue }
+                        let matchesMonitored = settings.monitoredProcessNames.contains { monitoredName in
+                            proc.name.localizedCaseInsensitiveContains(monitoredName) ||
+                            proc.path.localizedCaseInsensitiveContains(monitoredName)
+                        }
+                        if !matchesMonitored { continue }
                     }
 
                     // Track CPU history for sustained detection
@@ -177,24 +212,20 @@ class ProcessMonitor {
                     if history.count > 3 { history = Array(history.suffix(3)) }
                     self.cpuHistory[pid] = history
 
-                    // Sustained check: require at least 2 consecutive readings above threshold
                     if !immediate {
                         if history.count < 2 { continue }
-                        let allAbove = history.allSatisfy { $0 >= effectiveThreshold }
-                        if !allAbove { continue }
+                        if !history.allSatisfy({ $0 >= effectiveThreshold }) { continue }
                     }
 
-                    // Determine display name
                     let displayName: String
-                    if isSafari {
-                        displayName = "Safari"
-                    } else if isChrome {
-                        displayName = "Chrome"
+                    if let matched = settings.monitoredProcessNames.first(where: {
+                        proc.name.localizedCaseInsensitiveContains($0) || proc.path.localizedCaseInsensitiveContains($0)
+                    }) {
+                        displayName = matched
                     } else {
-                        displayName = processName
+                        displayName = proc.name
                     }
 
-                    // Skip user-ignored processes
                     if settings.ignoredProcesses.contains(displayName) { continue }
 
                     if let last = self.lastNotified[pid],
@@ -213,10 +244,9 @@ class ProcessMonitor {
                     }
                 }
 
-                // Clean up cpuHistory for PIDs no longer in the process list
+                // Clean up stale entries
                 self.cpuHistory = self.cpuHistory.filter { activePIDs.contains($0.key) }
-
-                // Clean old entries
+                self.previousCPUTimes = self.previousCPUTimes.filter { activePIDs.contains(String($0.key)) }
                 self.lastNotified = self.lastNotified.filter { now.timeIntervalSince($0.value) < settings.notificationCooldown * 2 }
             }
         }
@@ -485,6 +515,14 @@ class WatchDoggerDelegate: NSObject, NSApplicationDelegate, ProcessMonitorDelega
     var settingsWindow: SettingsWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single-instance protection
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.sh.watchdogger3"
+        if NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).count > 1 {
+            NSLog("WatchDogger: another instance is already running, exiting")
+            NSApp.terminate(nil)
+            return
+        }
+
         // Wire up delegates
         processMonitor.delegate = self
         notificationManager.actionDelegate = self

@@ -12,8 +12,7 @@ class SettingsManager: ObservableObject {
         static let cpuThreshold = "cpuThreshold"
         static let checkInterval = "checkInterval"
         static let notificationCooldown = "notificationCooldown"
-        static let monitorSafari = "monitorSafari"
-        static let monitorChrome = "monitorChrome"
+        static let monitoredProcessNames = "monitoredProcessNames"
         static let autoKill = "autoKill"
         static let launchAtLogin = "launchAtLogin"
         static let soundEnabled = "soundEnabled"
@@ -26,8 +25,7 @@ class SettingsManager: ObservableObject {
     private init() {
         defaults.register(defaults: [
             Keys.cpuThreshold: 90.0, Keys.checkInterval: 30.0,
-            Keys.notificationCooldown: 60.0, Keys.monitorSafari: true,
-            Keys.monitorChrome: true, Keys.autoKill: false,
+            Keys.notificationCooldown: 60.0, Keys.autoKill: false,
             Keys.launchAtLogin: false, Keys.soundEnabled: true,
             Keys.monitorAllProcesses: false,
             Keys.batteryModeEnabled: true,
@@ -47,13 +45,9 @@ class SettingsManager: ObservableObject {
         get { defaults.double(forKey: Keys.notificationCooldown) }
         set { defaults.set(newValue, forKey: Keys.notificationCooldown); objectWillChange.send() }
     }
-    var monitorSafari: Bool {
-        get { defaults.bool(forKey: Keys.monitorSafari) }
-        set { defaults.set(newValue, forKey: Keys.monitorSafari); objectWillChange.send() }
-    }
-    var monitorChrome: Bool {
-        get { defaults.bool(forKey: Keys.monitorChrome) }
-        set { defaults.set(newValue, forKey: Keys.monitorChrome); objectWillChange.send() }
+    var monitoredProcessNames: [String] {
+        get { defaults.stringArray(forKey: Keys.monitoredProcessNames) ?? ["Safari", "Chrome"] }
+        set { defaults.set(newValue, forKey: Keys.monitoredProcessNames); objectWillChange.send() }
     }
     var autoKill: Bool {
         get { defaults.bool(forKey: Keys.autoKill) }
@@ -97,12 +91,22 @@ class SettingsManager: ObservableObject {
         list.removeAll { $0 == name }
         ignoredProcesses = list
     }
+
+    func addMonitoredProcess(_ name: String) {
+        var list = monitoredProcessNames
+        if !list.contains(name) { list.append(name); monitoredProcessNames = list }
+    }
+
+    func removeMonitoredProcess(_ name: String) {
+        monitoredProcessNames = monitoredProcessNames.filter { $0 != name }
+    }
 }
 
 // MARK: - SwiftUI Settings View
 
 struct SettingsView: View {
     @ObservedObject var settings = SettingsManager.shared
+    @State private var newProcessName = ""
 
     let intervalOptions: [(String, TimeInterval)] = [
         ("10 seconds", 10), ("15 seconds", 15), ("30 seconds", 30),
@@ -165,20 +169,39 @@ struct SettingsView: View {
                     get: { settings.monitorAllProcesses },
                     set: { settings.monitorAllProcesses = $0 }
                 ))
-                Toggle("Safari", isOn: Binding(
-                    get: { settings.monitorSafari },
-                    set: { settings.monitorSafari = $0 }
-                ))
-                .disabled(settings.monitorAllProcesses)
-                Toggle("Chrome", isOn: Binding(
-                    get: { settings.monitorChrome },
-                    set: { settings.monitorChrome = $0 }
-                ))
-                .disabled(settings.monitorAllProcesses)
+
+                if !settings.monitorAllProcesses {
+                    ForEach(settings.monitoredProcessNames, id: \.self) { name in
+                        HStack {
+                            Text(name)
+                            Spacer()
+                            Button(role: .destructive) {
+                                settings.removeMonitoredProcess(name)
+                            } label: {
+                                Image(systemName: "minus.circle.fill")
+                                    .foregroundColor(.red)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    HStack {
+                        TextField("Process name", text: $newProcessName)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Add") {
+                            let name = newProcessName.trimmingCharacters(in: .whitespaces)
+                            if !name.isEmpty {
+                                settings.addMonitoredProcess(name)
+                                newProcessName = ""
+                            }
+                        }
+                        .disabled(newProcessName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
             } header: {
                 Text("What to watch")
             } footer: {
-                Text("Monitor all apps catches anything hogging your CPU. Or just keep an eye on browsers if that's where the trouble usually is.")
+                Text("Monitor all apps catches anything hogging your CPU. Or add specific process names to watch.")
                     .foregroundColor(.secondary)
             }
 

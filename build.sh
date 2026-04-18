@@ -22,6 +22,7 @@ swiftc -O -o "${MACOS}/${APP}" \
     -framework UserNotifications \
     -framework SwiftUI \
     -framework ServiceManagement \
+    -framework IOKit \
     main.swift SettingsWindow.swift
 
 echo "==> Generating icons..."
