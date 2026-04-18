@@ -1,95 +1,101 @@
 # WatchDogger
 
-Monitor Safari tabs for runaway CPU usage and kill them with a native notification.
+Menu bar app for macOS that watches your CPU and kills runaway processes.
 
-## Features
+You know the drill: you leave a tab open, walk away, come back and your fans are screaming. Or some app just hangs and starts eating a whole core for no reason. WatchDogger sits in the menu bar, keeps an eye on things, and pings you with a notification when something goes wrong. You tap Kill, the process dies, you move on.
 
-- Menu bar utility that runs silently in the background (no Dock icon)
-- Monitors WebKit.WebContent processes (Safari tabs) for high CPU usage
-- Sends native macOS notifications when a tab exceeds the CPU threshold
-- One-tap Kill button in notifications to terminate runaway processes
-- Configurable CPU threshold, check interval, and notification cooldown
-- Lightweight single-file Swift application
-- Programmatically generated app icon (blue shield with red eye)
+## Why
 
-## Quick Start
+Apps hang. Tabs go rogue. Background processes lose their minds. macOS doesn't tell you about any of this until your battery is dead or your laptop is too hot to touch. WatchDogger fills that gap — it watches CPU usage and lets you deal with problems before they become problems.
 
-1. **Build the app**
-   ```bash
-   cd /Users/sh/code/WatchDogger
-   swift main.swift
-   ```
+## What it does
 
-2. **Generate the icon** (optional, only if icon is missing)
-   ```bash
-   swift make-icon.swift
-   ```
+- Watches any process (or just specific ones from your watchlist) for high CPU
+- Sends a native notification when something crosses the line
+- Kill or Ignore straight from the notification, no windows to open
+- Auto-kill mode if you don't even want to be asked
+- Adapts the threshold when you're on battery (defaults to 25%)
+- Shows you what's eating CPU right now via the "What's hot" menu
+- Won't false-alarm on short spikes — needs 2+ readings in a row
+- No Dock icon, just the menu bar
 
-3. **Run the binary**
-   ```bash
-   ./main
-   ```
+## Quick start
 
-4. **Grant notification permissions** when prompted by macOS
-
-## Configuration
-
-Edit the constants at the top of `main.swift`:
-
-```swift
-let cpuThreshold: Double = 90.0           // CPU % threshold
-let checkInterval: TimeInterval = 30      // Check every N seconds
-let notificationCooldown: TimeInterval = 60 // Don't re-notify same PID for N seconds
+```bash
+git clone https://github.com/shmlkv/WatchDogger.git
+cd WatchDogger
+bash build.sh
+open WatchDogger.app
 ```
 
-## How It Works
-
-1. Every 30 seconds (configurable), the app runs `ps` to get a list of WebKit processes and their CPU usage
-2. If a process exceeds the CPU threshold, a notification is sent
-3. Users can tap "Kill" to send SIGTERM to the process, or "Ignore" to dismiss
-4. A cooldown prevents duplicate notifications for the same process within 60 seconds
-
-## Menu Bar
-
-- **Check Now** — Run a check immediately
-- **Quit** — Exit the app
-
-The app runs as LSUIElement (no Dock icon) and starts automatically as a menu bar item.
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Language | Swift 5.x |
-| Framework | Cocoa / AppKit |
-| Notifications | UserNotifications.framework |
-| Process Monitoring | ps command (shell) |
-| Codesigning | Ad-hoc |
-
-## Project Structure
-
-```
-WatchDogger/
-├── main.swift              # App delegate, monitoring logic, notification handling
-├── make-icon.swift         # Icon generator (blue shield + red eye)
-├── WatchDogger.app/        # Compiled app bundle
-│   └── Contents/
-│       ├── Info.plist      # Bundle configuration
-│       ├── MacOS/
-│       │   └── WatchDogger # Compiled binary
-│       └── Resources/
-│           └── AppIcon.icns # Generated icon set
-└── README.md
-```
+macOS will ask for notification permissions on first launch.
 
 ## Requirements
 
-- macOS 14 (Sonoma) or later
-- Notification permissions enabled
+macOS 14+ (Sonoma). Nothing else — no dependencies, no packages, no Homebrew.
 
-## Notes
+## How it works
 
-- The app is code-signed ad-hoc (no Apple Developer account required)
-- Bundle ID: `com.sh.watchdogger`
-- No external dependencies
-- Single-threaded event loop with Timer-based checks
+WatchDogger uses `libproc` (the native macOS process API) to snapshot CPU usage. No shelling out to `ps` or `top`. Every 30 seconds it takes a reading, computes CPU percentage from the delta, and compares against your threshold. If a process stays above the threshold for two consecutive checks, you get a notification. Tap Kill to send SIGTERM, or Ignore to never hear about that process again.
+
+When you're on battery, the threshold drops automatically so you catch smaller drains too.
+
+## Settings
+
+Open from the menu bar icon → "Open WatchDogger":
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| CPU threshold | 90% | How much CPU before you get alerted |
+| Check interval | 30s | Time between readings |
+| Cooldown | 60s | Don't nag about the same process within this window |
+| Battery mode | On | Uses a lower threshold (25%) on battery |
+| Monitor all apps | Off | Watch everything, not just the watchlist |
+| Watchlist | Safari, Chrome | Which processes to keep an eye on |
+| Auto-kill | Off | Skip the notification, just kill it |
+| Sound | On | Play a sound with the notification |
+| Launch at login | Off | Start automatically with macOS |
+
+## Menu bar
+
+- Open WatchDogger — settings window
+- Check Now — run a check right now (skips the 2-reading requirement)
+- What's hot — top 5 CPU consumers at this moment
+- Quit
+
+## Tech stack
+
+| | |
+|--|--|
+| Swift | AppKit + SwiftUI for the settings window |
+| libproc | `proc_pidinfo`, `proc_pidpath` for process monitoring |
+| IOKit | `IOPSCopyPowerSourcesInfo` for battery state |
+| UserNotifications | Native macOS notifications with actions |
+| ServiceManagement | Login item support |
+
+## Project structure
+
+```
+WatchDogger/
+├── main.swift             # ProcessMonitor, notifications, menu bar, app delegate
+├── SettingsWindow.swift   # Settings storage and SwiftUI settings view
+├── build.sh               # Compile, generate icon + sound, sign
+├── make-icon.swift        # Programmatic app icon (shield with eye)
+├── make-sound.swift       # Generates alert.aiff
+├── Info.plist             # LSUIElement, bundle ID
+├── Tests/
+│   └── WatchDoggerTests.swift
+└── WatchDogger.app/
+```
+
+## Tests
+
+```bash
+swiftc -o /tmp/wd_tests Tests/WatchDoggerTests.swift && /tmp/wd_tests
+```
+
+Covers sustained detection logic, cooldown filtering, process name matching, and history window management.
+
+## License
+
+MIT

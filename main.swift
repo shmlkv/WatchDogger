@@ -27,6 +27,7 @@ class ProcessMonitor {
     private var cpuHistory: [String: [Double]] = [:]
     private var lastNotified: [String: Date] = [:]
     private var previousCPUTimes: [pid_t: (user: UInt64, system: UInt64, timestamp: TimeInterval)] = [:]
+    private var menuCPUTimes: [pid_t: (user: UInt64, system: UInt64, timestamp: TimeInterval)] = [:]
 
     // Battery state cache — re-checked every 5th monitoring cycle
     private var cachedOnBattery: Bool = false
@@ -39,6 +40,14 @@ class ProcessMonitor {
         "coreaudiod", "powerd", "launchd", "syslogd", "configd", "mds",
         "mds_stores", "mdworker", "opendirectoryd", "distnoted",
         "usermanagerd", "trustd"
+    ]
+
+    // Maps helper process path patterns to their parent app name for matching
+    private let helperProcessAliases: [(pattern: String, parentName: String)] = [
+        ("WebKit.WebContent", "Safari"),
+        ("Google Chrome Helper", "Chrome"),
+        ("Firefox.app", "Firefox"),
+        ("Microsoft Edge Helper", "Edge"),
     ]
 
     // MARK: Native Process Listing (libproc)
@@ -104,41 +113,55 @@ class ProcessMonitor {
         return results
     }
 
-    /// Calculate CPU % from two snapshots. Must be called on main thread.
-    private func calculateCPU(pid: pid_t, user: UInt64, system: UInt64) -> Double {
+    private typealias CPUSample = (user: UInt64, system: UInt64, timestamp: TimeInterval)
+
+    /// Calculate CPU % from delta between two snapshots.
+    private func calculateCPU(pid: pid_t, user: UInt64, system: UInt64,
+                              store: inout [pid_t: CPUSample]) -> Double {
         let now = Foundation.ProcessInfo.processInfo.systemUptime
         let totalNow = user + system
 
-        if let prev = previousCPUTimes[pid] {
+        if let prev = store[pid] {
             let dt = now - prev.timestamp
             if dt > 0.1 {
                 let totalPrev = prev.user + prev.system
                 let deltaCPU = Double(totalNow - totalPrev) / 1_000_000_000.0 // ns → s
                 let cpuPercent = (deltaCPU / dt) * 100.0
-                previousCPUTimes[pid] = (user: user, system: system, timestamp: now)
+                store[pid] = (user: user, system: system, timestamp: now)
                 return max(0, cpuPercent)
             }
         }
 
         // First sample — store baseline, return 0
-        previousCPUTimes[pid] = (user: user, system: system, timestamp: now)
+        store[pid] = (user: user, system: system, timestamp: now)
         return 0
     }
 
     func getTopCPUProcesses() -> [CPUProcessInfo] {
-        // Synchronous snapshot for menu — runs on main thread
+        // Synchronous snapshot for menu — uses separate CPU store to not interfere with monitoring
         let snapshot = snapshotProcesses()
 
         var results: [CPUProcessInfo] = []
         for proc in snapshot {
-            let cpu = calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem)
+            let cpu = calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem,
+                                   store: &menuCPUTimes)
             guard cpu >= 5.0 else { continue }
             if excludedProcesses.contains(proc.name) { continue }
-            results.append(CPUProcessInfo(name: proc.name, cpu: cpu, pid: String(proc.pid)))
+            let displayName = helperProcessAliases.first(where: { proc.path.contains($0.pattern) })?.parentName ?? proc.name
+            results.append(CPUProcessInfo(name: displayName, cpu: cpu, pid: String(proc.pid)))
         }
 
         results.sort { $0.cpu > $1.cpu }
         return Array(results.prefix(5))
+    }
+
+    /// Take an initial CPU snapshot so the first timer tick can compute real deltas
+    func warmUpBaseline() {
+        let snapshot = snapshotProcesses()
+        for proc in snapshot {
+            _ = calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem,
+                             store: &previousCPUTimes)
+        }
     }
 
     // MARK: Battery State (IOKit)
@@ -193,13 +216,21 @@ class ProcessMonitor {
                     let pid = String(proc.pid)
                     activePIDs.insert(pid)
 
-                    let cpu = self.calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem)
+                    let cpu = self.calculateCPU(pid: proc.pid, user: proc.cpuUser, system: proc.cpuSystem,
+                                                store: &self.previousCPUTimes)
                     guard cpu >= effectiveThreshold else { continue }
+
+                    // Resolve helper process to parent app name via aliases
+                    let resolvedParent = self.helperProcessAliases.first(where: {
+                        proc.path.contains($0.pattern)
+                    })?.parentName
 
                     if settings.monitorAllProcesses {
                         if self.excludedProcesses.contains(proc.name) { continue }
                     } else {
+                        let nameToMatch = resolvedParent ?? proc.name
                         let matchesMonitored = settings.monitoredProcessNames.contains { monitoredName in
+                            nameToMatch.localizedCaseInsensitiveContains(monitoredName) ||
                             proc.name.localizedCaseInsensitiveContains(monitoredName) ||
                             proc.path.localizedCaseInsensitiveContains(monitoredName)
                         }
@@ -217,14 +248,7 @@ class ProcessMonitor {
                         if !history.allSatisfy({ $0 >= effectiveThreshold }) { continue }
                     }
 
-                    let displayName: String
-                    if let matched = settings.monitoredProcessNames.first(where: {
-                        proc.name.localizedCaseInsensitiveContains($0) || proc.path.localizedCaseInsensitiveContains($0)
-                    }) {
-                        displayName = matched
-                    } else {
-                        displayName = proc.name
-                    }
+                    let displayName = resolvedParent ?? proc.name
 
                     if settings.ignoredProcesses.contains(displayName) { continue }
 
@@ -529,6 +553,23 @@ class WatchDoggerDelegate: NSObject, NSApplicationDelegate, ProcessMonitorDelega
         menuBarController.actionDelegate = self
         menuBarController.processMonitor = processMonitor
 
+        // App main menu (enables Cmd+W / Cmd+Q keyboard shortcuts)
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Quit WatchDogger", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+
         // Menu bar icon
         menuBarController.setup()
 
@@ -539,6 +580,8 @@ class WatchDoggerDelegate: NSObject, NSApplicationDelegate, ProcessMonitorDelega
         // Defer notification setup and monitoring to not block UI
         DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
             self?.notificationManager.setup()
+            // Warm up CPU baseline so first real check already has delta
+            self?.processMonitor.warmUpBaseline()
             self?.startTimer()
         }
     }
